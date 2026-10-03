@@ -34,6 +34,9 @@ Alternativa pelo privado do bot: `/ativar @seucanal`
 
 Para parar: `/desativar` (no canal ou no privado).
 
+💡 O `/puxar` também funciona postado direto no canal/grupo:
+`/puxar 5` → publica na hora as 5 promoções mais quentes do momento.
+
 > 🔒 **Dono do bot:** o primeiro usuário que falar com o bot no privado vira
 > o dono — só ele pode usar os comandos de configuração. Então mande um
 > `/start` para o bot logo após o deploy!
@@ -43,6 +46,7 @@ Para parar: `/desativar` (no canal ou no privado).
 | Comando | O que faz |
 |---|---|
 | `/status` | Mostra canal ativo, filtros e estatísticas |
+| `/puxar 3` | Publica as 3 promos mais quentes do momento 🔥 (1 a 10) |
 | `/testar` | Publica a oferta mais recente no canal agora |
 | `/intervalo 15` | Busca ofertas a cada 15 min (padrão 10) |
 | `/maxposts 3` | Máx. de posts por ciclo (padrão 5) |

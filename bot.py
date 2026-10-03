@@ -222,6 +222,7 @@ def scraper_loop():
     while True:
         try:
             st = load_state()
+            seen |= set(st.get("seen", []))  # sincroniza com /puxar e /testar
             channel = st.get("channel_id", "")
             offers = fetch_offers()
             novos = [o for o in offers if o["offerId"] not in seen]
@@ -273,6 +274,7 @@ HELP = (
     "   (ou me mande aqui: <code>/ativar @seucanal</code>)\n\n"
     "<b>⚙️ Configurações (aqui no privado):</b>\n"
     "/status — configuração atual e estatísticas\n"
+    "/puxar 3 — publica as 3 promos mais quentes do momento 🔥\n"
     "/testar — publica a oferta mais recente agora\n"
     "/intervalo 15 — minutos entre buscas\n"
     "/maxposts 3 — máx. de posts por busca\n"
@@ -322,8 +324,9 @@ def handle_private(msg, st):
         reply(chat_id, f"🆔 chat_id: <code>{chat_id}</code>")
         return
 
-    if cmd in ("/ativar", "/desativar", "/status", "/testar", "/intervalo",
-               "/maxposts", "/desconto", "/bloquear", "/lojas", "/limparfiltros"):
+    if cmd in ("/ativar", "/desativar", "/status", "/testar", "/puxar",
+               "/intervalo", "/maxposts", "/desconto", "/bloquear", "/lojas",
+               "/limparfiltros"):
         if not is_owner(st, user_id):
             reply(chat_id, "🔒 Apenas o dono do bot pode usar este comando.")
             return
@@ -391,6 +394,36 @@ def handle_private(msg, st):
         else:
             reply(chat_id, "❌ Não consegui publicar. Ainda sou admin do canal?")
 
+    elif cmd == "/puxar":
+        if not st.get("channel_id"):
+            reply(chat_id, "❌ Nenhum canal ativado. Use /ativar primeiro.")
+            return
+        try:
+            n = max(1, min(10, int(args))) if args else 3
+        except ValueError:
+            n = 3
+        reply(chat_id, f"🔎 Buscando as {n} promoções mais quentes do momento…")
+        offers = [o for o in fetch_offers() if passes_filters(o, st)]
+        # mais quentes primeiro (engajamento no Promobit)
+        offers.sort(key=lambda o: o.get("offerEngagementScore") or 0, reverse=True)
+        seen = set(st.get("seen", []))
+        # prioriza as que ainda não foram postadas no canal
+        fila = ([o for o in offers if o["offerId"] not in seen] +
+                [o for o in offers if o["offerId"] in seen])[:n]
+        postadas = 0
+        for o in fila:
+            if post_offer(o, st["channel_id"]):
+                postadas += 1
+                seen.add(o["offerId"])
+                _stats["postadas"] += 1
+                time.sleep(4)  # rate-limit do Telegram
+        st["seen"] = list(seen)
+        save_state(st)
+        if postadas:
+            reply(chat_id, f"🔥 Publiquei <b>{postadas}</b> promoção(ões) do momento no canal!")
+        else:
+            reply(chat_id, "❌ Não consegui publicar. Ainda sou admin do canal?")
+
     elif cmd == "/intervalo":
         try:
             v = max(2, min(240, int(args)))
@@ -450,11 +483,31 @@ def handle_private(msg, st):
 
 
 def handle_channel_post(msg, st):
-    """Comandos postados dentro do canal/grupo: /ativar e /desativar."""
+    """Comandos postados dentro do canal/grupo: /ativar, /desativar, /puxar."""
     text = (msg.get("text") or "").strip()
     text = re.sub(r"^(/\w+)@\w+", r"\1", text)
     chat = msg.get("chat", {})
     chat_id = chat.get("id")
+
+    if text.startswith("/puxar"):
+        parts = text.split()
+        try:
+            n = max(1, min(10, int(parts[1]))) if len(parts) > 1 else 3
+        except ValueError:
+            n = 3
+        offers = [o for o in fetch_offers() if passes_filters(o, st)]
+        offers.sort(key=lambda o: o.get("offerEngagementScore") or 0, reverse=True)
+        seen = set(st.get("seen", []))
+        fila = ([o for o in offers if o["offerId"] not in seen] +
+                [o for o in offers if o["offerId"] in seen])[:n]
+        for o in fila:
+            if post_offer(o, chat_id):
+                seen.add(o["offerId"])
+                _stats["postadas"] += 1
+                time.sleep(4)
+        st["seen"] = list(seen)
+        save_state(st)
+        return
 
     if text.startswith("/ativar"):
         activate_channel(st, chat_id, chat.get("title", ""))
@@ -495,7 +548,8 @@ def handle_update(upd):
             handle_private(msg, st)
         elif ctype in ("group", "supergroup"):
             text = (msg.get("text") or "")
-            if text.startswith("/ativar") or text.startswith("/desativar"):
+            if (text.startswith("/ativar") or text.startswith("/desativar")
+                    or text.startswith("/puxar")):
                 handle_channel_post(msg, st)
 
 
