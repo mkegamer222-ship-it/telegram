@@ -28,10 +28,16 @@ filtros — é configurado por **comandos no próprio Telegram**.
 
 ### Evitar a hibernação do plano free ⏰
 
-O free do Render hiberna após ~15 min sem tráfego. O bot tem um endpoint de
-health check — crie um monitor gratuito no [UptimeRobot](https://uptimerobot.com)
-(ou cron-job.org) pingando a URL do serviço
-(`https://promo-bot-xxxx.onrender.com`) **a cada 5 min**.
+O free do Render hiberna após ~15 min sem tráfego HTTP. Proteção em 2 camadas:
+
+1. **Auto-ping embutido (já vem ligado!)** — o bot pinga a própria URL a cada
+   4 min usando a env `RENDER_EXTERNAL_URL` (criada automaticamente pelo
+   Render). Nos logs aparece: `[keepalive] auto-ping ativo…`
+2. **UptimeRobot (recomendado como garantia)** — se o serviço reiniciar ou
+   cair, o auto-ping não consegue acordá-lo de fora. Crie um monitor grátis:
+   - [uptimerobot.com](https://uptimerobot.com) → **+ New Monitor**
+   - Type: **HTTP(s)** | URL: `https://promo-bot-xxxx.onrender.com`
+   - Interval: **5 minutes** → Create
 
 ## 🔛 Ativando o bot num canal (por comandos!)
 

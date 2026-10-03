@@ -967,6 +967,25 @@ def updates_loop():
             time.sleep(5)
 
 
+# ------------------------------------------------- keep-alive (anti-sono) --
+def keep_alive_loop():
+    """Impede a hibernação do plano free do Render: pinga a própria URL
+    pública a cada 4 min. O Render fornece a URL automaticamente na env
+    RENDER_EXTERNAL_URL — não precisa configurar nada."""
+    url = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    if not url:
+        print("[keepalive] RENDER_EXTERNAL_URL não encontrada — auto-ping "
+              "desativado (normal fora do Render).")
+        return
+    print(f"[keepalive] auto-ping ativo a cada 4 min → {url}")
+    while True:
+        time.sleep(240)  # 4 minutos
+        try:
+            requests.get(url, timeout=20)
+        except Exception as e:
+            print(f"[keepalive] ping falhou: {e}")
+
+
 # --------------------------------------------- servidor http (health) ------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -1019,4 +1038,5 @@ if __name__ == "__main__":
     threading.Thread(target=scraper_loop, daemon=True).start()
     threading.Thread(target=auto_puxar_loop, daemon=True).start()
     threading.Thread(target=updates_loop, daemon=True).start()
+    threading.Thread(target=keep_alive_loop, daemon=True).start()
     http_server()
