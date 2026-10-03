@@ -52,7 +52,15 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 PROMOBIT_URLS = [
     "https://www.promobit.com.br/",
     "https://www.promobit.com.br/promocoes/recentes/",
+    "https://www.promobit.com.br/promocoes/recentes/?page=2",
+    "https://www.promobit.com.br/promocoes/recentes/?page=3",
 ]
+
+CUPONS_URL = "https://www.promobit.com.br/cupons/"
+CUPONS_LOJA_URL = "https://www.promobit.com.br/cupons/loja/{slug}/"
+
+# score de engajamento a partir do qual a oferta ganha o selo "BOMBANDO"
+HOT_SCORE = 300
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
@@ -67,6 +75,10 @@ DEFAULT_STATE = {
     "palavras_bloqueadas": [],
     "lojas_permitidas": [],
     "seen": [],
+    "seen_cupons": [],
+    "auto_cupons": False,
+    "auto_puxar": False,
+    "auto_puxar_min": 1,
 }
 
 _lock = threading.Lock()
@@ -88,6 +100,7 @@ def load_state():
 def save_state(st):
     with _lock:
         st["seen"] = st["seen"][-5000:]
+        st["seen_cupons"] = st.get("seen_cupons", [])[-2000:]
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(st, f, ensure_ascii=False)
 
@@ -108,40 +121,219 @@ def reply(chat_id, text):
 
 
 # ------------------------------------------------------------- promobit ----
-def fetch_offers():
-    offers, ids = [], set()
-    for url in PROMOBIT_URLS:
+API_BASE = "https://api.promobit.com.br"
+API_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "application/json",
+    "Origin": "https://www.promobit.com.br",
+    "Referer": "https://www.promobit.com.br/",
+}
+
+
+def _api_get(path, tries=2):
+    """GET na API oficial do Promobit (com retry). None se falhar."""
+    for i in range(tries):
+        try:
+            r = requests.get(API_BASE + path, headers=API_HEADERS, timeout=30)
+            if r.status_code == 200:
+                return r.json()
+        except Exception as e:
+            print(f"[api] tentativa {i+1} falhou em {path}: {e}")
+        time.sleep(2 * (i + 1))
+    return None
+
+
+def _snake_to_camel(k):
+    parts = k.split("_")
+    return parts[0] + "".join(p.capitalize() for p in parts[1:])
+
+
+def _normalize(d):
+    """Converte as chaves snake_case da API para o formato camelCase."""
+    return {_snake_to_camel(k): v for k, v in d.items()} if isinstance(d, dict) else d
+
+
+def _get_next_data(url, tries=2):
+    """Baixa uma página do Promobit e devolve o pageProps (com retry)."""
+    for i in range(tries):
         try:
             r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
             m = re.search(
                 r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
                 r.text, re.S)
-            if not m:
-                continue
-            data = json.loads(m.group(1))
-            page = (data.get("props", {}).get("pageProps", {})
-                        .get("serverOffers", {}).get("offers", []))
-            for o in page:
-                oid = o.get("offerId")
-                if oid and oid not in ids and o.get("offerStatusName") == "APPROVED":
-                    ids.add(oid)
-                    offers.append(o)
+            if m:
+                return json.loads(m.group(1)).get("props", {}).get("pageProps", {})
         except Exception as e:
-            print(f"[promobit] erro em {url}: {e}")
+            print(f"[promobit] tentativa {i+1} falhou em {url}: {e}")
+            time.sleep(2 * (i + 1))
+    return {}
+
+
+def community_ok(o):
+    """Descarta ofertas mal avaliadas pela comunidade do Promobit."""
+    r = o.get("ratings") or {}
+    positivos = (r.get("great") or 0) + (r.get("good") or 0) + (r.get("amazing") or 0)
+    negativos = r.get("bad") or 0
+    return not (negativos >= 3 and negativos > positivos)
+
+
+def real_discount(o):
+    """% de desconto informado, ou calculado pelo preço antigo."""
+    disc = o.get("offerDiscontPercentage") or 0
+    if disc:
+        return float(disc)
+    try:
+        price, old = float(o.get("offerPrice") or 0), float(o.get("offerOldPrice") or 0)
+        if old > price > 0.02 and old > 0.02:
+            return (1 - price / old) * 100
+    except Exception:
+        pass
+    return 0
+
+
+OK_STATUSES = {"APPROVED", "TOP_OFFER", "RECENTS"}
+
+
+def _collect(raw_list, offers, ids):
+    for raw in raw_list or []:
+        o = _normalize(raw)
+        oid = o.get("offerId")
+        if (oid and oid not in ids
+                and o.get("offerStatusName") in OK_STATUSES
+                and community_ok(o)):
+            ids.add(oid)
+            offers.append(o)
+
+
+def fetch_offers(pages=2):
+    """Ofertas mais recentes — API oficial (2 páginas = ~100 ofertas),
+    com fallback para o scraping do site se a API falhar."""
+    offers, ids = [], set()
+
+    cursor = ""
+    for _ in range(pages):
+        d = _api_get(f"/offers?limit=50&sort=latest"
+                     + (f"&after={cursor}" if cursor else ""))
+        if not d:
+            break
+        _collect(d.get("offers"), offers, ids)
+        cursor = d.get("after") or ""
+        if not cursor:
+            break
+
+    if not offers:  # fallback: scraping das páginas HTML
+        print("[promobit] API indisponível, usando fallback HTML…")
+        for url in PROMOBIT_URLS:
+            pp = _get_next_data(url)
+            _collect(pp.get("serverOffers", {}).get("offers", []), offers, ids)
+
     offers.sort(key=lambda o: o.get("offerPublished", ""), reverse=True)
     return offers
 
 
+def fetch_hot_offers():
+    """Ofertas mais quentes do momento (ranking 'hot' + destaques da API)."""
+    offers, ids = [], set()
+    d = _api_get("/offers?limit=50&sort=hot")
+    if d:
+        _collect(d.get("offers"), offers, ids)
+    feat = _api_get("/offers/featured?limit=20")
+    if isinstance(feat, list):
+        _collect(feat, offers, ids)
+    if not offers:
+        offers = fetch_offers()
+    offers.sort(key=lambda o: o.get("offerEngagementScore") or 0, reverse=True)
+    return offers
+
+
+# --------------------------------------------------------------- cupons ----
+def fetch_coupons(store=None):
+    """Cupons ativos do Promobit — API oficial (geral ou por loja),
+    com fallback para o scraping do site."""
+    raw = None
+    if store:
+        slug = re.sub(r"[^a-z0-9]+", "-",
+                      store.lower().strip().replace("@", "")).strip("-")
+        raw = _api_get(f"/stores/{slug}/coupons?limit=40")
+    else:
+        raw = _api_get("/coupon?limit=50")
+
+    coupons = [_normalize(c) for c in raw] if isinstance(raw, list) else []
+
+    if not coupons:  # fallback HTML
+        url = CUPONS_LOJA_URL.format(slug=slug) if store else CUPONS_URL
+        pp = _get_next_data(url)
+        coupons = pp.get("serverCoupons", {}).get("coupons", [])
+
+    out, ids = [], set()
+    for c in coupons:
+        cid = c.get("couponId")
+        if cid and cid not in ids and c.get("couponStatusName") == "APPROVED" \
+                and c.get("couponCode"):
+            ids.add(cid)
+            out.append(c)
+    # mais recentemente verificados primeiro
+    out.sort(key=lambda c: c.get("couponVerified") or "", reverse=True)
+    return out
+
+
+def build_coupon_message(c):
+    store = html_mod.escape(c.get("storeName") or "")
+    title = html_mod.escape(c.get("couponTitle") or f"Cupom {store}")
+    disc = html_mod.escape(c.get("couponDiscountShort") or
+                           c.get("couponDiscountValue") or "")
+    on = html_mod.escape(c.get("couponDiscountOn") or "")
+    code = html_mod.escape(str(c.get("couponCode") or ""))
+    instr = (c.get("couponInstructions") or "").strip()
+    until = c.get("couponUntil")
+
+    lines = [f"🎟️ <b>CUPOM {store.upper()}</b>", "", f"<b>{title}</b>"]
+    if disc:
+        lines.append(f"💸 {disc}" + (f" em {on}" if on else ""))
+    lines.append(f"🔑 Código: <code>{code}</code>  (toque para copiar)")
+    if instr:
+        if len(instr) > 180:
+            instr = instr[:177] + "…"
+        lines.append(f"📋 {html_mod.escape(instr.capitalize())}")
+    if until:
+        try:
+            d = until[:10].split("-")
+            lines.append(f"⏳ Válido até {d[2]}/{d[1]}/{d[0]}")
+        except Exception:
+            pass
+    lines += ["", "📣 Promoções e cupons todo dia — compartilhe o canal!"]
+
+    keyboard = {"inline_keyboard": [[
+        {"text": f"🛒 Usar cupom na {c.get('storeName', 'loja')}",
+         "url": f"https://www.promobit.com.br/Redirect/cupom/{c.get('couponId')}"},
+    ]]}
+    return "\n".join(lines), keyboard
+
+
+def post_coupon(c, chat_id):
+    text, keyboard = build_coupon_message(c)
+    res = tg("sendMessage", chat_id=chat_id, text=text,
+             parse_mode="HTML", reply_markup=keyboard)
+    if not res.get("ok"):
+        print(f"[cupom] ERRO: {res.get('description')}")
+    return res.get("ok", False)
+
+
 # -------------------------------------------------------------- filtros ----
+def _norm_store(s):
+    """'Mercado Livre' / 'mercado-livre' / 'MercadoLivre' → 'mercadolivre'"""
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
 def passes_filters(o, st):
     title = (o.get("offerTitle") or "").lower()
-    store = (o.get("storeName") or "").lower()
+    store = _norm_store(o.get("storeName"))
 
     for w in st.get("palavras_bloqueadas", []):
         if w.lower() in title:
             return False
 
-    lojas = [s.lower() for s in st.get("lojas_permitidas", [])]
+    lojas = [_norm_store(s) for s in st.get("lojas_permitidas", [])]
     if lojas and store not in lojas:
         return False
 
@@ -163,14 +355,17 @@ def fmt_price(v):
 def build_message(o):
     title = html_mod.escape(o.get("offerTitle") or "Oferta")
     store = html_mod.escape(o.get("storeName") or "")
+    categoria = html_mod.escape(o.get("categoryName") or "")
     price = o.get("offerPrice")
     old = o.get("offerOldPrice") or 0
-    disc = o.get("offerDiscontPercentage") or 0
+    disc = real_discount(o)
     coupon = o.get("offerCoupon")
     slug = o.get("offerSlug") or ""
     oid = o.get("offerId")
+    hot = (o.get("offerEngagementScore") or 0) >= HOT_SCORE
 
-    lines = [f"🔥 <b>{title}</b>", ""]
+    header = "🚨🔥 <b>BOMBANDO!</b>\n" if hot else ""
+    lines = [f"{header}🔥 <b>{title}</b>", ""]
     if price and float(price) > 0.02:
         p = f"💰 <b>{fmt_price(price)}</b>"
         if o.get("offerPriceType") == "STARTING_AT":
@@ -178,12 +373,15 @@ def build_message(o):
         if old and float(old) > float(price) and float(old) > 0.02:
             p += f"  <s>{fmt_price(old)}</s>"
         if disc:
-            p += f"  (-{round(float(disc))}%)"
+            p += f"  (-{round(disc)}%)"
         lines.append(p)
     if coupon:
-        lines.append(f"🎟️ Cupom: <code>{html_mod.escape(str(coupon))}</code>")
+        lines.append(f"🎟️ Cupom: <code>{html_mod.escape(str(coupon))}</code>  (toque para copiar)")
     if store:
-        lines.append(f"🏪 Loja: {store}")
+        loja = f"🏪 Loja: {store}"
+        if categoria:
+            loja += f"  |  📂 {categoria}"
+        lines.append(loja)
     lines += ["", "📣 Promoções todo dia — compartilhe o canal!"]
 
     caption = "\n".join(lines)
@@ -254,6 +452,22 @@ def scraper_loop():
                     else:
                         time.sleep(4)
 
+            # ------- cupons automáticos (se ativado com /autocupons on) ----
+            if channel and st.get("auto_cupons"):
+                seen_cup = set(st.get("seen_cupons", []))
+                novos_cup = [c for c in fetch_coupons()
+                             if c["couponId"] not in seen_cup][:2]
+                if not seen_cup and novos_cup:
+                    # 1ª vez: marca tudo como visto e posta só 1
+                    seen_cup = {c["couponId"] for c in fetch_coupons()}
+                    novos_cup = novos_cup[:1]
+                for c in novos_cup:
+                    if post_coupon(c, channel):
+                        print(f"[cupom] ✔ {c.get('storeName')}: {c.get('couponCode')}")
+                        seen_cup.add(c["couponId"])
+                        time.sleep(4)
+                st["seen_cupons"] = list(seen_cup)
+
             st["seen"] = list(seen)
             save_state(st)
         except Exception as e:
@@ -261,6 +475,38 @@ def scraper_loop():
 
         st = load_state()
         time.sleep(max(2, int(st.get("intervalo", 10))) * 60)
+
+
+# ------------------------------------------------------ loop auto-puxar ----
+def auto_puxar_loop():
+    """Com /autopuxar on: publica 1 promoção quente a cada X min (padrão 1).
+    Nunca repete — quando não há oferta inédita, simplesmente pula a vez."""
+    while True:
+        st = load_state()
+        minutos = max(1, min(60, int(st.get("auto_puxar_min", 1))))
+        time.sleep(minutos * 60)
+        try:
+            st = load_state()
+            if not (st.get("auto_puxar") and st.get("channel_id")):
+                continue
+            seen = set(st.get("seen", []))
+            fila = [o for o in fetch_hot_offers()
+                    if o["offerId"] not in seen and passes_filters(o, st)]
+            if not fila:  # sem quente inédita → tenta as recentes
+                fila = [o for o in fetch_offers(pages=1)
+                        if o["offerId"] not in seen and passes_filters(o, st)]
+            if not fila:
+                print("[autopuxar] nenhuma oferta inédita agora — pulando.")
+                continue
+            o = fila[0]
+            if post_offer(o, st["channel_id"]):
+                print(f"[autopuxar] ✔ {o.get('offerTitle', '')[:60]}")
+                seen.add(o["offerId"])
+                _stats["postadas"] += 1
+                st["seen"] = list(seen)
+                save_state(st)
+        except Exception as e:
+            print(f"[autopuxar] erro: {e}")
 
 
 # ------------------------------------------------------------- comandos ----
@@ -272,15 +518,26 @@ HELP = (
     "1. Me adicione como <b>administrador</b> do canal\n"
     "2. Poste <code>/ativar</code> dentro do canal\n"
     "   (ou me mande aqui: <code>/ativar @seucanal</code>)\n\n"
+    "<b>🔥 Promoções:</b>\n"
+    "/puxar 3 — publica as 3 promos mais quentes do momento\n"
+    "/autopuxar on — posta 1 promo quente a cada 1 min 🤖\n"
+    "/autopuxar 5 — mesma coisa, a cada 5 min\n"
+    "/autopuxar off — desliga\n"
+    "/testar — publica a oferta mais recente agora\n\n"
+    "<b>🎟️ Cupons:</b>\n"
+    "/cupons — vê os cupons ativos do momento (aqui no chat)\n"
+    "/cupons amazon — cupons de uma loja específica\n"
+    "/puxarcupons 3 — publica 3 cupons no canal\n"
+    "/autocupons on — posta cupons novos automaticamente\n\n"
     "<b>⚙️ Configurações (aqui no privado):</b>\n"
     "/status — configuração atual e estatísticas\n"
-    "/puxar 3 — publica as 3 promos mais quentes do momento 🔥\n"
-    "/testar — publica a oferta mais recente agora\n"
     "/intervalo 15 — minutos entre buscas\n"
     "/maxposts 3 — máx. de posts por busca\n"
     "/desconto 30 — % mínimo de desconto\n"
     "/bloquear capinha,película — bloquear termos\n"
-    "/lojas amazon,kabum — só essas lojas\n"
+    "/lojas amazon,kabum,aliexpress — só essas lojas\n"
+    "/lojas add aliexpress — adiciona uma loja à lista\n"
+    "/lojas remover shopee — tira uma loja da lista\n"
     "/limparfiltros — remove todos os filtros\n"
     "/desativar — para de postar no canal\n"
     "/id — chat_id desta conversa"
@@ -325,6 +582,7 @@ def handle_private(msg, st):
         return
 
     if cmd in ("/ativar", "/desativar", "/status", "/testar", "/puxar",
+               "/autopuxar", "/cupons", "/puxarcupons", "/autocupons",
                "/intervalo", "/maxposts", "/desconto", "/bloquear", "/lojas",
                "/limparfiltros"):
         if not is_owner(st, user_id):
@@ -381,6 +639,8 @@ def handle_private(msg, st):
               f"Desconto mínimo: {st.get('desconto_minimo') or 'sem filtro'}\n"
               f"Termos bloqueados: {html_mod.escape(bloq)}\n"
               f"Lojas: {html_mod.escape(lojas)}\n"
+              f"Cupons automáticos: {'ligado ✅' if st.get('auto_cupons') else 'desligado ❌'}\n"
+              f"Puxa automático: {('ligado ✅ (' + str(st.get('auto_puxar_min', 1)) + ' min)') if st.get('auto_puxar') else 'desligado ❌'}\n"
               f"Online há: {up_h:.1f} h\n"
               f"Ciclos: {_stats['ciclos']} | Postadas: {_stats['postadas']}")
 
@@ -403,9 +663,7 @@ def handle_private(msg, st):
         except ValueError:
             n = 3
         reply(chat_id, f"🔎 Buscando as {n} promoções mais quentes do momento…")
-        offers = [o for o in fetch_offers() if passes_filters(o, st)]
-        # mais quentes primeiro (engajamento no Promobit)
-        offers.sort(key=lambda o: o.get("offerEngagementScore") or 0, reverse=True)
+        offers = [o for o in fetch_hot_offers() if passes_filters(o, st)]
         seen = set(st.get("seen", []))
         # prioriza as que ainda não foram postadas no canal
         fila = ([o for o in offers if o["offerId"] not in seen] +
@@ -423,6 +681,102 @@ def handle_private(msg, st):
             reply(chat_id, f"🔥 Publiquei <b>{postadas}</b> promoção(ões) do momento no canal!")
         else:
             reply(chat_id, "❌ Não consegui publicar. Ainda sou admin do canal?")
+
+    elif cmd == "/autopuxar":
+        v = args.lower().strip()
+        if v in ("on", "ligado", "sim", "1min", "ligar"):
+            st["auto_puxar"] = True
+            st["auto_puxar_min"] = 1
+            save_state(st)
+            reply(chat_id, "🤖 Puxa automático <b>ATIVADO</b>: vou postar "
+                           "1 promoção quente a cada <b>1 minuto</b>.\n"
+                           "Quando não houver promo inédita, eu pulo a vez "
+                           "(nunca repito oferta).\n\n"
+                           "Para mudar o ritmo: <code>/autopuxar 5</code> | "
+                           "Para desligar: <code>/autopuxar off</code>")
+        elif v in ("off", "desligado", "nao", "não", "0", "desligar"):
+            st["auto_puxar"] = False
+            save_state(st)
+            reply(chat_id, "🤖 Puxa automático <b>desligado</b>.")
+        elif v.isdigit():
+            minutos = max(1, min(60, int(v)))
+            st["auto_puxar"] = True
+            st["auto_puxar_min"] = minutos
+            save_state(st)
+            reply(chat_id, f"🤖 Puxa automático <b>ATIVADO</b>: 1 promoção "
+                           f"quente a cada <b>{minutos} min</b>.")
+        else:
+            atual = (f"ligado ✅ (a cada {st.get('auto_puxar_min', 1)} min)"
+                     if st.get("auto_puxar") else "desligado ❌")
+            reply(chat_id, f"Puxa automático: <b>{atual}</b>\n"
+                           "Use: <code>/autopuxar on</code> (1 min), "
+                           "<code>/autopuxar 5</code> (5 min) ou "
+                           "<code>/autopuxar off</code>")
+
+    elif cmd == "/cupons":
+        loja = args.split()[0] if args else None
+        reply(chat_id, "🔎 Buscando cupons ativos…")
+        cupons = fetch_coupons(loja)
+        if not cupons:
+            reply(chat_id, f"❌ Nenhum cupom encontrado"
+                  + (f" para <b>{html_mod.escape(loja)}</b>. Tente o nome como "
+                     "aparece no Promobit (ex: amazon, magazine-luiza, "
+                     "mercado-livre, shopee, aliexpress, kabum)." if loja else "."))
+            return
+        linhas = [f"🎟️ <b>Cupons ativos{' — ' + html_mod.escape(cupons[0].get('storeName','')) if loja else ''}</b>\n"]
+        for c in cupons[:10]:
+            disc = c.get("couponDiscountShort") or c.get("couponDiscountValue") or ""
+            on = c.get("couponDiscountOn") or ""
+            linha = (f"• <b>{html_mod.escape(c.get('storeName',''))}</b> — "
+                     f"{html_mod.escape(disc)}"
+                     + (f" em {html_mod.escape(on)}" if on else "")
+                     + f"\n  🔑 <code>{html_mod.escape(str(c.get('couponCode')))}</code>")
+            linhas.append(linha)
+        linhas.append("\n💡 Use /puxarcupons 3 para publicar no canal.")
+        reply(chat_id, "\n".join(linhas))
+
+    elif cmd == "/puxarcupons":
+        if not st.get("channel_id"):
+            reply(chat_id, "❌ Nenhum canal ativado. Use /ativar primeiro.")
+            return
+        partes = args.split() if args else []
+        n, loja = 3, None
+        for p in partes:
+            if p.isdigit():
+                n = max(1, min(10, int(p)))
+            else:
+                loja = p
+        reply(chat_id, f"🔎 Publicando {n} cupom(ns) no canal…")
+        cupons = fetch_coupons(loja)
+        seen_cup = set(st.get("seen_cupons", []))
+        fila = ([c for c in cupons if c["couponId"] not in seen_cup] +
+                [c for c in cupons if c["couponId"] in seen_cup])[:n]
+        postados = 0
+        for c in fila:
+            if post_coupon(c, st["channel_id"]):
+                postados += 1
+                seen_cup.add(c["couponId"])
+                time.sleep(4)
+        st["seen_cupons"] = list(seen_cup)
+        save_state(st)
+        reply(chat_id, f"🎟️ Publiquei <b>{postados}</b> cupom(ns) no canal!"
+              if postados else "❌ Não consegui publicar nenhum cupom.")
+
+    elif cmd == "/autocupons":
+        v = args.lower().strip()
+        if v in ("on", "ligado", "sim", "1"):
+            st["auto_cupons"] = True
+            save_state(st)
+            reply(chat_id, "🎟️ Cupons automáticos <b>ATIVADOS</b> — vou postar "
+                           "cupons novos a cada ciclo de busca.")
+        elif v in ("off", "desligado", "nao", "não", "0"):
+            st["auto_cupons"] = False
+            save_state(st)
+            reply(chat_id, "🎟️ Cupons automáticos <b>desativados</b>.")
+        else:
+            atual = "ligado ✅" if st.get("auto_cupons") else "desligado ❌"
+            reply(chat_id, f"Cupons automáticos: <b>{atual}</b>\n"
+                           "Use: <code>/autocupons on</code> ou <code>/autocupons off</code>")
 
     elif cmd == "/intervalo":
         try:
@@ -464,7 +818,27 @@ def handle_private(msg, st):
                            "Use: <code>/bloquear capinha,película</code>")
 
     elif cmd == "/lojas":
-        if args:
+        sub, _, resto = args.partition(" ")
+        sub = sub.lower()
+        if sub in ("add", "adicionar", "+") and resto.strip():
+            novas = [w.strip().lower() for w in resto.split(",") if w.strip()]
+            lojas = [l.lower() for l in st.get("lojas_permitidas", [])]
+            for n in novas:
+                if n not in lojas:
+                    lojas.append(n)
+            st["lojas_permitidas"] = lojas
+            save_state(st)
+            reply(chat_id, "🏪 Loja(s) adicionada(s)! Lista atual: "
+                  f"<b>{html_mod.escape(', '.join(lojas))}</b>")
+        elif sub in ("remover", "remove", "tirar", "-") and resto.strip():
+            tirar = [w.strip().lower() for w in resto.split(",") if w.strip()]
+            lojas = [l for l in st.get("lojas_permitidas", [])
+                     if l.lower() not in tirar]
+            st["lojas_permitidas"] = lojas
+            save_state(st)
+            reply(chat_id, "🏪 Removida(s)! Lista atual: "
+                  f"<b>{html_mod.escape(', '.join(lojas)) or 'todas as lojas'}</b>")
+        elif args:
             st["lojas_permitidas"] = [w.strip() for w in args.split(",") if w.strip()]
             save_state(st)
             reply(chat_id, "🏪 Só vou postar ofertas de: "
@@ -472,7 +846,10 @@ def handle_private(msg, st):
         else:
             atual = ", ".join(st.get("lojas_permitidas", [])) or "todas"
             reply(chat_id, f"Lojas permitidas: <b>{html_mod.escape(atual)}</b>\n"
-                           "Use: <code>/lojas amazon,kabum</code>")
+                           "Exemplos:\n"
+                           "<code>/lojas amazon,kabum,aliexpress</code> — define a lista\n"
+                           "<code>/lojas add aliexpress</code> — adiciona\n"
+                           "<code>/lojas remover shopee</code> — remove")
 
     elif cmd == "/limparfiltros":
         st["palavras_bloqueadas"] = []
@@ -488,15 +865,15 @@ def handle_channel_post(msg, st):
     text = re.sub(r"^(/\w+)@\w+", r"\1", text)
     chat = msg.get("chat", {})
     chat_id = chat.get("id")
+    cmd = text.split()[0] if text else ""
 
-    if text.startswith("/puxar"):
+    if cmd == "/puxar":
         parts = text.split()
         try:
             n = max(1, min(10, int(parts[1]))) if len(parts) > 1 else 3
         except ValueError:
             n = 3
-        offers = [o for o in fetch_offers() if passes_filters(o, st)]
-        offers.sort(key=lambda o: o.get("offerEngagementScore") or 0, reverse=True)
+        offers = [o for o in fetch_hot_offers() if passes_filters(o, st)]
         seen = set(st.get("seen", []))
         fila = ([o for o in offers if o["offerId"] not in seen] +
                 [o for o in offers if o["offerId"] in seen])[:n]
@@ -509,11 +886,31 @@ def handle_channel_post(msg, st):
         save_state(st)
         return
 
-    if text.startswith("/ativar"):
+    if cmd == "/puxarcupons":
+        parts = text.split()
+        n, loja = 3, None
+        for p in parts[1:]:
+            if p.isdigit():
+                n = max(1, min(10, int(p)))
+            else:
+                loja = p
+        cupons = fetch_coupons(loja)
+        seen_cup = set(st.get("seen_cupons", []))
+        fila = ([c for c in cupons if c["couponId"] not in seen_cup] +
+                [c for c in cupons if c["couponId"] in seen_cup])[:n]
+        for c in fila:
+            if post_coupon(c, chat_id):
+                seen_cup.add(c["couponId"])
+                time.sleep(4)
+        st["seen_cupons"] = list(seen_cup)
+        save_state(st)
+        return
+
+    if cmd == "/ativar":
         activate_channel(st, chat_id, chat.get("title", ""))
         tg("sendMessage", chat_id=chat_id,
            text="✅ Canal ativado! As promoções serão publicadas aqui. 🔥")
-    elif text.startswith("/desativar"):
+    elif cmd == "/desativar":
         if str(st.get("channel_id")) == str(chat_id):
             st["channel_id"] = ""
             st["channel_title"] = ""
@@ -549,7 +946,8 @@ def handle_update(upd):
         elif ctype in ("group", "supergroup"):
             text = (msg.get("text") or "")
             if (text.startswith("/ativar") or text.startswith("/desativar")
-                    or text.startswith("/puxar")):
+                    or text.startswith("/puxar")
+                    or text.startswith("/puxarcupons")):
                 handle_channel_post(msg, st)
 
 
@@ -619,5 +1017,6 @@ if __name__ == "__main__":
               "/ativar no canal.")
 
     threading.Thread(target=scraper_loop, daemon=True).start()
+    threading.Thread(target=auto_puxar_loop, daemon=True).start()
     threading.Thread(target=updates_loop, daemon=True).start()
     http_server()
